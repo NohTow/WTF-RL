@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import logging
 import os
 import sys
@@ -26,13 +27,10 @@ import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 
-
 from multiprocessing import Pool
 from nltk.translate.bleu_score import SmoothingFunction
 
-
 from datasets import load_dataset
-
 
 import torch
 from torch.optim import Adam, Optimizer
@@ -61,17 +59,17 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoFeatureExtractor,
+    AutoProcessor,
     DataCollatorForSeq2Seq,
     HfArgumentParser,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     set_seed,
-    OFAModel,
-    OFATokenizer,
+    BlipForConditionalGeneration,
+    # BlipTokenizer,
     Trainer,
     PreTrainedModel,
-    OFAConfig,
-    CLIPFeatureExtractor,
+    BlipConfig,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
@@ -276,7 +274,6 @@ def scale_grad_value_(parameters, scale_value: float) -> None:
     scale_value = float(scale_value)
     for p in filter(lambda p: p.grad is not None, parameters):
         p.grad.mul_(scale_value)
-
 class SelfBleu():
     def __init__(self, test_text='', sample_size=1000, gram=5):
         super().__init__()
@@ -360,7 +357,8 @@ class SelfBleu():
 class GCN(PreTrainedModel):
     def __init__(self, config, generator_name_or_path, discriminator_name_or_path, cache_dir, learning_rate, custom_args):
         super(GCN, self).__init__(config)
-        self.generator = OFAModel.from_pretrained("OFA_tuning_TF_MSCOCO_fixatt_repro/checkpoint-9000", use_cache=False)
+        self.generator = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large")
+    
         self.discriminator = AutoModel.from_pretrained(
         "openai/clip-vit-base-patch32", cache_dir=".cache"
         )
@@ -371,19 +369,20 @@ class GCN(PreTrainedModel):
             torch.nn.ReLU(),
             torch.nn.Linear(256, 2),
         )
+        
         self.MLP.load_state_dict(torch.load("pretrained_disc_scst_repro_27999"))
         self.MLP_optimizer = Adam([
                 {'params': self.MLP.parameters()},
         ], lr=7e-5)
-        self.tokenizer_OFA = OFATokenizer.from_pretrained(base_path + "OFA/weights/" + generator_name_or_path, verbose=False)
-        self.tokenizer_CLIP = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32", cache_dir=".cache")
+        self.tokenizer_BLIP = AutoTokenizer.from_pretrained("Salesforce/blip-image-captioning-large")
+        self.tokenizer_CLIP = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32", cache_dir="/srv/tempdd/achaffin/.cache")
         self.BCELoss = torch.nn.BCELoss()
         self.optimizer_gen = (Adam(list(self.generator.parameters()), lr=learning_rate))
         self.scheduler_gen = get_constant_schedule_with_warmup(self.optimizer_gen, 100)
         self.baseline = custom_args.baseline
         self.disc_weight = custom_args.disc_weight
 
-
+    
 
 # We use torchvision for faster image pre-processing. The transforms are implemented as nn.Module,
 # so we jit it to be faster.
@@ -411,7 +410,7 @@ class TransformWithAugmentation(torch.nn.Module):
             x = [self.transforms(x) for i in range(self.n_views)]
         return x
 
-class Transform_OFA(torch.nn.Module):
+class Transform_BLIP(torch.nn.Module):
     def __init__(self, resolution, mean, std):
         super().__init__()
         self.preprocess = torch.nn.Sequential(
@@ -444,7 +443,7 @@ class Transform_CLIP(torch.nn.Module):
 
 def collate_fn_train(examples):
     input_ids = torch.tensor([example["input_ids"] for example in examples], dtype=torch.long)
-    patch_images = torch.stack([torch.tensor(example["patch_images_OFA"], dtype=torch.float) for example in examples])
+    pixel_values_BLIP = torch.stack([torch.tensor(example["pixel_values_BLIP"], dtype=torch.float) for example in examples])
     image_clip_embeds = torch.tensor([example["image_clip_embeds"] for example in examples], dtype=torch.float)
     neighbours_image_embeddings = torch.tensor([embeddings for example in examples for embeddings in example["embeddings_neighbours"]], dtype=torch.float)
     decoder_input_ids = torch.tensor([example["decoder_input_ids"] for example in examples], dtype=torch.long)
@@ -452,7 +451,7 @@ def collate_fn_train(examples):
     row_id = torch.tensor([example["row_id"] for example in examples], dtype=torch.float)
     return {
         "input_ids": input_ids,
-        "patch_images_OFA": patch_images,
+        "pixel_values_BLIP": pixel_values_BLIP,
         "image_clip_embeds": image_clip_embeds,
         "neighbours_image_embeddings": neighbours_image_embeddings,
         "decoder_input_ids": decoder_input_ids,
@@ -462,14 +461,14 @@ def collate_fn_train(examples):
 
 def collate_fn(examples):
     input_ids = torch.tensor([example["input_ids"] for example in examples], dtype=torch.long)
-    patch_images = torch.stack([torch.tensor(example["patch_images_OFA"], dtype=torch.float) for example in examples])
+    pixel_values_BLIP = torch.stack([torch.tensor(example["pixel_values_BLIP"], dtype=torch.float) for example in examples])
     image_clip_embeds = torch.tensor([example["image_clip_embeds"] for example in examples], dtype=torch.float)
     decoder_input_ids = torch.tensor([example["decoder_input_ids"] for example in examples], dtype=torch.long)
     attention_mask = torch.tensor([example["attention_mask"] for example in examples], dtype=torch.long)
     row_id = torch.tensor([example["row_id"] for example in examples], dtype=torch.float)
     return {
         "input_ids": input_ids,
-        "patch_images_OFA": patch_images,
+        "pixel_values_BLIP": pixel_values_BLIP,
         "image_clip_embeds": image_clip_embeds,
         "decoder_input_ids": decoder_input_ids,
         "attention_mask": attention_mask,
@@ -479,7 +478,6 @@ def collate_fn(examples):
 transtab = str.maketrans({key: None for key in string.punctuation})
 class TransformTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, is_eval=False):
-
         # Disable BatchNorm & Dropout
         # for module in model.discriminator.modules():
         #     if isinstance(module, torch.nn.BatchNorm2d) or isinstance(module, torch.nn.Dropout):
@@ -497,20 +495,13 @@ class TransformTrainer(Trainer):
         #             module.bias.requires_grad_(False)
         #         module.eval()
         if(is_eval):
-            outputs = model.generator(inputs["input_ids"], patch_images=inputs["patch_images_OFA"], decoder_input_ids=inputs["decoder_input_ids"], attention_mask=inputs["attention_mask"], use_cache=True)
             labels = torch.clone(inputs["decoder_input_ids"])
-            shift_logits = outputs["logits"][..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            shift_labels[~inputs["attention_mask"][..., 1:].bool()] = -100
-            loss_fct = torch.nn.CrossEntropyLoss()
-            lm_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            output_sequences = model.generator.generate(inputs["input_ids"], patch_images=inputs["patch_images_OFA"], num_beams=5, no_repeat_ngram_size=3, use_cache=True, max_length=50)
-            tokenized_captions = model.tokenizer_CLIP(["{}".format(sequence.replace(".", "")) for sequence in model.tokenizer_OFA.batch_decode(output_sequences, skip_special_tokens=True)], padding="longest", truncation=True, return_tensors="pt").to(model.device)
-            
+            output_sequences = model.generator.generate(pixel_values=inputs["pixel_values_BLIP"], input_ids=inputs["input_ids"], num_beams=3, max_length=20)
+            print(["{}".format(sequence.replace(".", "")) for sequence in model.tokenizer_BLIP.batch_decode(output_sequences, skip_special_tokens=True)])
+            tokenized_captions = model.tokenizer_CLIP(["{}".format(sequence.replace(".", "")) for sequence in model.tokenizer_CLIP.batch_decode(output_sequences, skip_special_tokens=True)], padding="longest", truncation=True, return_tensors="pt").to(model.device)
             text_outputs = model.discriminator.text_model(
                 input_ids=tokenized_captions["input_ids"],
                 attention_mask=tokenized_captions["attention_mask"],
-                # position_ids=inputs["position_ids"],
                 return_dict=model.config.return_dict
             )
             text_embeds = text_outputs[1]
@@ -521,42 +512,44 @@ class TransformTrainer(Trainer):
             outputs_clip = {}
             outputs_clip["text_embeds"] = text_embeds
             outputs_clip["image_embeds"] = inputs["image_clip_embeds"]
-            
-
-            return (lm_loss, (output_sequences, labels), outputs_clip)
-        
+            return (torch.tensor(0.0, requires_grad=False), (output_sequences, labels), outputs_clip)
+  
         image_embeds = inputs["image_clip_embeds"]
-        
+    
         # Generate captions
         with torch.no_grad():
             # Beam search
-            output_policy = model.generator.generate(inputs["input_ids"], patch_images=inputs["patch_images_OFA"], num_beams=5, bad_words_ids=self.model.bad_words_id, no_repeat_ngram_size=3, use_cache=True, return_dict_in_generate=True, output_scores=True, max_new_tokens=50)
-        
+            output_policy = model.generator.generate(pixel_values=inputs["pixel_values_BLIP"], num_beams=5, no_repeat_ngram_size=3, return_dict_in_generate=True) # model.generator.generate(pixel_values=inputs
+            
             # Greedy search
-            output_baseline = model.generator.generate(inputs["input_ids"], patch_images=inputs["patch_images_OFA"], bad_words_ids=self.model.bad_words_id, do_sample=False, use_cache=True, return_dict_in_generate=True, max_new_tokens=50)
-
+            output_baseline = model.generator.generate(pixel_values=inputs["pixel_values_BLIP"], do_sample=False, return_dict_in_generate=True)
+   
+        
         # Computing logits of generated captions with a forward pass (using scores of HF is a mess, especially for BS)
-        gt_logits = model.generator(inputs["input_ids"], patch_images=inputs["patch_images_OFA"], decoder_input_ids=inputs["decoder_input_ids"], use_cache=True, return_dict=True)["logits"]
+        gt_logits = model.generator(pixel_values=inputs["pixel_values_BLIP"], input_ids=inputs["decoder_input_ids"], return_dict=True)["decoder_logits"]
         shift_logits = gt_logits[..., :-1, :].contiguous()
         shift_labels = inputs["decoder_input_ids"][..., 1:].contiguous()
         loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=1)
         logprob_gt = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         logprob_gt = - logprob_gt.view(shift_logits.size(0), shift_logits.size(1))
-        
-        policy_logits = model.generator(inputs["input_ids"], patch_images=inputs["patch_images_OFA"], decoder_input_ids=output_policy["sequences"], use_cache=True, return_dict=True)["logits"]
+
+        policy_logits = model.generator(pixel_values=inputs["pixel_values_BLIP"], input_ids=output_policy["sequences"], return_dict=True)["decoder_logits"]
         shift_logits = policy_logits[..., :-1, :].contiguous()
         shift_labels = output_policy["sequences"][..., 1:].contiguous()
         loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=1)
         logprob_policy = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         logprob_policy = - logprob_policy.view(shift_logits.size(0), shift_logits.size(1))
-        
 
+        
         # Decoding sequences to feed it to CLIP
-        discriminator_inputs_text = ["{}".format(sequence.replace(".", "").strip()) for sequence in model.tokenizer_OFA.batch_decode(output_policy["sequences"], skip_special_tokens=True)]+ ["{}".format(sequence.replace(".", "").strip()) for sequence in model.tokenizer_OFA.batch_decode(inputs["decoder_input_ids"], skip_special_tokens=True)] + ["{}".format(sequence.replace(".", "").strip()) for sequence in model.tokenizer_OFA.batch_decode(output_baseline["sequences"], skip_special_tokens=True)]
-       
+        discriminator_inputs_text =  ["{}".format(sequence.replace(".", "").strip()) for sequence in model.tokenizer_BLIP.batch_decode(output_policy["sequences"], skip_special_tokens=True)] + ["{}".format(sequence.replace(".", "").strip()) for sequence in model.tokenizer_BLIP.batch_decode(inputs["decoder_input_ids"], skip_special_tokens=True)] + ["{}".format(sequence.replace(".", "").strip()) for sequence in model.tokenizer_BLIP.batch_decode(output_baseline["sequences"], skip_special_tokens=True)]
+      
+  
+        
         print("Policy text {}".format(discriminator_inputs_text[:int(len(discriminator_inputs_text)/3)]))
         print("GT text {}".format(["{}".format(discriminator_inputs_text[int(len(discriminator_inputs_text)/3):2*int(len(discriminator_inputs_text)/3)])]))
         print("Baseline text {}".format(["{}".format(discriminator_inputs_text[2*int(len(discriminator_inputs_text)/3):])]))
+        print(inputs["row_id"])
         tokenized_captions = model.tokenizer_CLIP(discriminator_inputs_text, padding="longest", truncation=True, return_tensors="pt").to(model.device)
         # Computing CLIP embeddings
         text_outputs = model.discriminator.text_model(
@@ -577,10 +570,10 @@ class TransformTrainer(Trainer):
         labels_disc = torch.zeros((disc_logits.shape[0], ), device=model.device)
         labels_disc[(labels_disc.shape[0] // 2):] = 1
         loss_disc = model.BCELoss(disc_scores[:, 1], labels_disc)
+
         self.log({"MLP_acc": (torch.sum(torch.argmax(disc_scores, dim=1) == labels_disc) / len(disc_scores)).item()})
         loss_disc.backward()
         self.model.MLP_optimizer.step()
-        
         # Which neighbours to keep as baselines. Too many/hard lead to too negative rewards and require to add a constant to the reward to not crash
         neighbours_to_keep = [3,4]
         logits = torch.matmul(text_embeds, torch.cat((image_embeds, inputs["neighbours_image_embeddings"][torch.tensor([neighbor_to_keep + i*5 for i in range(inputs["input_ids"].shape[0]) for neighbor_to_keep in neighbours_to_keep], dtype=torch.long)]), dim=0).t()) * model.discriminator.logit_scale.exp()
@@ -599,7 +592,7 @@ class TransformTrainer(Trainer):
         log_prob_text = logits - ((exp_logits * (loss_mask_txt == 0)).sum(0) - exp_logits).log()
         log_prob_img = logits.T - ((exp_logits.t() * (loss_mask_img == 0).t()).sum(0) - exp_logits.t()).log()
    
-    
+      
         # Prevent underflow by clipping reward to log(2**-23) in case sum_exp have been dominated by the largest value and so the substraction return 0, hence log return -inf and the reward is thus inf
         log_prob_text = torch.clamp(log_prob_text, max=16)
         log_prob_img = torch.clamp(log_prob_img, max=16)
@@ -608,7 +601,8 @@ class TransformTrainer(Trainer):
 
         log_prob_text /= model.discriminator.logit_scale.exp()
         log_prob_img /= model.discriminator.logit_scale.exp()
-
+        
+        
         # Unidirectional reward
         # rewards_policy = torch.diag(log_prob_text[:(logits.shape[0]//3)])
         # Bidirectional reward
@@ -621,27 +615,25 @@ class TransformTrainer(Trainer):
         # Rewards are CLIP + discriminator
         rewards_gt = (0.94 * rewards_gt + 0.06 * disc_scores_gt)
         rewards_policy = (0.94 * rewards_policy + 0.06 * disc_scores_policy) # + 0.0125 unidirectionnal rewards are more
-        
         self.log({"mean_reward_policy": torch.mean(rewards_policy).item()})
         self.log({"mean_reward_disc_gt": torch.mean(disc_scores_gt).item()})
         self.log({"mean_reward_disc_policy": torch.mean(disc_scores_policy).item()})
+         
         self.log({"mean_total_reward_policy": torch.mean(rewards_policy).item()})
         self.log({"mean_total_reward_gt": torch.mean(rewards_gt).item()})
-         
         # RL loss
         policy_loss = - torch.mean((rewards_policy).detach() * torch.mean(logprob_policy, dim=1))
         # WTF loss
         policy_loss = policy_loss - torch.mean((rewards_policy).detach() * torch.mean(logprob_policy, dim=1))
-        
         self.log({"policy_loss": (policy_loss).item()})
         
         policy_loss.backward()
         # Gradient accumulation
         # if(((self.state.global_step + 1) % 1) == 0):
+
         #     self.model.optimizer_gen.step()
         #     self.model.scheduler_gen.step()
         #     self.model.optimizer_gen.zero_grad()
-
         
         return torch.tensor(0.0, requires_grad=True)
  
@@ -649,12 +641,10 @@ class TransformTrainer(Trainer):
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
-            (loss, outputs_ofa, outputs_clip) = self.compute_loss(model, inputs, return_outputs=True, is_eval=True)
-        return (loss, outputs_ofa, (outputs_clip["text_embeds"], outputs_clip["image_embeds"]))
-        
+            (loss, outputs_blip, outputs_clip) = self.compute_loss(model, inputs, return_outputs=True, is_eval=True)
+        return (loss, outputs_blip, (outputs_clip["text_embeds"], outputs_clip["image_embeds"]))
     def get_train_dataloader(self):
         train_dataset = self.train_dataset
-    
         train_sampler = self._get_train_sampler()
         return torch.utils.data.DataLoader(
             train_dataset,
@@ -764,9 +754,9 @@ def main():
 
     # Load pretrained model and tokenizer
     base_path = "VisualNews/"
-    tokenizer_ofa = OFATokenizer.from_pretrained(base_path + "OFA/weights/" + model_args.generator_name_or_path, verbose=False)
-    tokenizer_clip = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32", cache_dir=".cache")
-    config = OFAConfig.from_pretrained(base_path + "OFA/weights/" + model_args.generator_name_or_path)
+    tokenizer_blip = AutoTokenizer.from_pretrained("Salesforce/blip-image-captioning-large")
+    tokenizer_clip = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32", cache_dir="/srv/tempdd/achaffin/.cache")
+    config = BlipConfig.from_pretrained("Salesforce/blip-image-captioning-large")
     model = GCN(config, model_args.generator_name_or_path, model_args.discriminator_name_or_path, cache_dir=model_args.cache_dir, learning_rate=training_args.learning_rate, custom_args=custom_args)
     model.cuda()
     config_clip = model.discriminator.config
@@ -775,8 +765,9 @@ def main():
         cache_dir=model_args.cache_dir,
     )
 
-    model.generator.resize_token_embeddings(len(tokenizer_ofa))
-    
+
+   
+
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
     if training_args.do_train:
@@ -807,21 +798,14 @@ def main():
             raise ValueError(
                 f"--image_column' value '{data_args.image_column}' needs to be one of: {', '.join(column_names)}"
             )
-
-    mean, std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
-    if("tiny" in model_args.generator_name_or_path):
-        print("Tiny model")
-        resolution = 256
-    elif("base" in model_args.generator_name_or_path.lower()):
-        print("Base model")
-        resolution = 384
-    elif("large" in model_args.generator_name_or_path.lower() or "huge" in model_args.generator_name_or_path.lower()):
-        print("Large/huge model")
-        resolution = 480
-    image_transformations_ofa = Transform_OFA(
+    
+    mean, std = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
+    # mean, std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+    resolution = 384
+    image_transformations_blip = Transform_BLIP(
         resolution, mean, std
     )
-    image_transformations_ofa = torch.jit.script(image_transformations_ofa)
+    image_transformations_blip = torch.jit.script(image_transformations_blip)
 
     image_transformations_clip = Transform_CLIP(
         model.discriminator.config.vision_config.image_size, feature_extractor.image_mean, feature_extractor.image_std
@@ -831,44 +815,42 @@ def main():
     convert_tensor = transforms.ToTensor()
     
     def preprocess_function_train(examples):
-        prompt_generator = " what does the image describe?"
-        prompts_generator = tokenizer_ofa(prompt_generator)
+        prompt_generator = "A photography of"
+        prompts_generator = tokenizer_blip(prompt_generator)
         prompts_generator = [prompts_generator.input_ids] * len(examples[caption_column])
         examples["input_ids"] = prompts_generator
 
         captions = [caption.split("&&")[0].strip() for caption in examples[caption_column]]
 
-        text_inputs = tokenizer_ofa(captions, padding="max_length", max_length=256, truncation=True)
+        text_inputs = tokenizer_blip(captions, padding="max_length", max_length=77, truncation=True)
         examples["decoder_input_ids"] = text_inputs.input_ids
         examples["attention_mask"] = text_inputs.attention_mask
-
-
-        images = [convert_tensor(Image.open(BytesIO(base64.b64decode(img_data))).convert('RGB')) for img_data in examples[image_column]]
-
+        images = [Image.open(BytesIO(base64.b64decode(img_data))).convert('RGB') for img_data in examples[image_column]]
+        examples["pixel_values_BLIP"] = processor(images, return_tensors="pt")["pixel_values"]
         examples["image_clip_embeds"] = [embedding for embedding in examples["img_embeds"]]
         nearest_neighbors = [neighbours for neighbours in examples["nearest_neighbors"]]
         examples["embeddings_neighbours"] = [train_img_embeds[nearest_neighbor] for nearest_neighbor in nearest_neighbors] 
+       
         del examples['predicted_object_labels']
-
+        # del examples['img']
+        # del examples[caption_column]
         return examples
-
     def preprocess_function(examples):
-        prompt_generator = " what does the image describe?"
-        prompts_generator = tokenizer_ofa(prompt_generator)
+        prompt_generator = "A photography of"
+        prompts_generator = tokenizer_blip(prompt_generator)
         prompts_generator = [prompts_generator.input_ids] * len(examples[caption_column])
         examples["input_ids"] = prompts_generator
 
         captions = [caption.split("&&")[0].strip() for caption in examples[caption_column]]
-        text_inputs = tokenizer_ofa(captions, padding="max_length", max_length=256, truncation=True)
+    
+        text_inputs = tokenizer_blip(captions, padding="max_length", max_length=77, truncation=True)
         examples["decoder_input_ids"] = text_inputs.input_ids
         examples["attention_mask"] = text_inputs.attention_mask
-
-
-        images = [convert_tensor(Image.open(BytesIO(base64.b64decode(img_data))).convert('RGB')) for img_data in examples[image_column]]
-        examples["patch_images_OFA"] = [image_transformations_ofa(image) for image in images]
+        images = [Image.open(BytesIO(base64.b64decode(img_data))).convert('RGB') for img_data in examples[image_column]]
+        examples["pixel_values_BLIP"] = processor(images, return_tensors="pt")["pixel_values"]
         with torch.no_grad():
             vision_outputs = model.discriminator.vision_model(
-                pixel_values=torch.stack([image_transformations_clip(image) for image in images]).to(model.device),
+                pixel_values=torch.stack([image_transformations_clip(convert_tensor(image)) for image in images]).to(model.device),
                 return_dict=model.config.return_dict
             )
             image_embeds = vision_outputs[1]
@@ -881,10 +863,11 @@ def main():
         examples["image_clip_embeds"] = image_embeds.cpu().numpy()
         del examples['predicted_object_labels']
         return examples
-
+    processor = AutoProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
     def transform_images(examples):
         images = [convert_tensor(Image.open(BytesIO(base64.b64decode(img_data))).convert('RGB')) for img_data in examples[image_column]]
-        examples["patch_images_OFA"] = [image_transformations_ofa(image) for image in images]
+        examples["pixel_values_CLIP"] = [image_transformations_clip(image) for image in images]
+        examples["pixel_values_BLIP"] = processor(images, return_tensors="pt")["pixel_values"]
         return examples
 
     def filter_corrupt_images(examples):
@@ -905,14 +888,11 @@ def main():
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
         train_dataset = train_dataset.add_column("row_id", np.arange(len(train_dataset)))
-
-
         # Loading pre-computed embeddings
         train_img_embeds = np.load("embeddings/image_embeddings_train.npy")
         train_text_embeds = np.load("embeddings/caption_embeddings_train.npy")
         train_dataset_embeddings = datasets.Dataset.from_dict({"caption_embeds": train_text_embeds, "img_embeds": train_img_embeds, "nearest_neighbors": np.load("embeddings/nn_train.npy")})
         train_dataset = datasets.concatenate_datasets([train_dataset, train_dataset_embeddings], axis=1)
-
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
@@ -926,9 +906,7 @@ def main():
                 num_proc=data_args.preprocessing_num_workers,
                 # remove_columns=column_names,
                 load_from_cache_file=not data_args.overwrite_cache,
-                # load_from_cache_file=True,
                 desc="Running tokenizer on train dataset",
-                new_fingerprint="train_coco_mining"
             )
             # train_dataset.set_transform(transform_images)
 
@@ -938,8 +916,6 @@ def main():
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation"]
         eval_dataset = eval_dataset.add_column("row_id", np.arange(len(eval_dataset)))
-
-
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
@@ -953,11 +929,8 @@ def main():
                 num_proc=data_args.preprocessing_num_workers,
                 # remove_columns=column_names,
                 load_from_cache_file=not data_args.overwrite_cache,
-                # load_from_cache_file=False,
                 desc="Running tokenizer on validation dataset",
-                new_fingerprint="eval_coco"
             )
-            # eval_dataset.set_transform(transform_images)
 
     if training_args.do_predict:
         # max_target_length = data_args.val_max_target_length
@@ -978,11 +951,8 @@ def main():
             )
             # eval_dataset.set_transform(transform_images)
 
-
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    
-    
-    
+
     def compute_metrics(eval_preds):
         (preds, labels), (text_embeds, image_embeds) = eval_preds
         preds = np.where(preds != -100, preds, tokenizer_ofa.pad_token_id)
@@ -1026,8 +996,11 @@ def main():
         SBleu = SelfBleu(decoded_preds, sample_size=1000)
         result["SelfBLEU"] = SBleu.get_bleu_fast()
         
-    
+        
         return result
+    
+
+
     trainer = TransformTrainer(
         model=model,
         args=training_args,
